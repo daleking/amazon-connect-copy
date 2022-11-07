@@ -138,8 +138,10 @@ TEMPA=${TEMPFILE}_A
 TEMPB=${TEMPFILE}_B
 TEMP1=${TEMPFILE}_1
 TEMP2=${TEMPFILE}_2
-trap 'rm -r -- $TEMPFILE $TEMPERR $TEMPNEW $TEMPOLD $TEMPA $TEMPB $TEMP1 $TEMP2' EXIT
-touch $TEMPFILE $TEMPERR $TEMPNEW $TEMPOLD $TEMPA $TEMPB $TEMP1 $TEMP2
+TEMP3=${TEMPFILE}_3
+TEMP4=${TEMPFILE}_4
+trap 'rm -r -- $TEMPFILE $TEMPERR $TEMPNEW $TEMPOLD $TEMPA $TEMPB $TEMP1 $TEMP2 $TEMP4' EXIT
+touch $TEMPFILE $TEMPERR $TEMPNEW $TEMPOLD $TEMPA $TEMPB $TEMP1 $TEMP2 $TEMP4
 
 actionLead="# Action -"
 dryrun=
@@ -516,6 +518,7 @@ gen_helper_rpqr() {
     routing_name=$1
     out_file="$helper/routingQRs_$routing_name.json"
     cat "$instance_alias_dir_a/routingQs_$routing_name.json" |
+    jq -c '.RoutingProfileQueueConfigSummaryList[]' | head -10 | jq -s . '{RoutingProfileQueueConfigSummaryList: map(.)}' |
     jq ".RoutingProfileQueueConfigSummaryList[] |
         { QueueReference: { QueueId, Channel }, Priority, Delay }" \
     > "$out_file"
@@ -598,8 +601,11 @@ EOD
             continue
         fi
 
+	#cat $routing_new_file | egrep -v 'NumberOfAssociatedQueues|NumberOfAssociatedUsers' | sed -re 's/(\"Tags\"\:.*),/\1/g' >${routing_new_file}_modified
+	cat $routing_new_file | egrep -v 'NumberOfAssociatedQueues|NumberOfAssociatedUsers' >${routing_new_file}_modified
+#	cat ${routing_new_file}_modified
         aws_connect create-routing-profile \
-            --cli-input-json "file://$routing_new_file" \
+            --cli-input-json "file://${routing_new_file}_modified" \
             > "$out_file" || error $LINENO
         routing_id_b=$(jq -r ".RoutingProfileId" "$out_file" | dos2unix)
 
@@ -691,7 +697,7 @@ else
 
             cat "$instance_alias_dir_b/$routing_json" |
             jq -r ".RoutingProfile.MediaConcurrencies[] | select(.Concurrency != 0)" |
-            jq -s > "$helper/routingConcurrency_$routing_name.json"
+            jq -s . > "$helper/routingConcurrency_$routing_name.json"
 
             cat <<EOD >> "$helper_log"
 
@@ -746,12 +752,13 @@ EOD
             if [ -s $TEMP2 ]; then
                 cat $TEMP2 |
                 while read q_name; do
+		    echo "---" >&2
                     # cat "$instance_alias_dir_a/routingQs_$routing_name.json" |
                     #     jq -r ".RoutingProfileQueueConfigSummaryList[] | select(.QueueName == \"${q_name//\"/\\\"}\") | { QueueReference: { QueueId, Channel }, Priority, Delay }" >> $TEMP1
                     sed -e's/\\"/%22/g' "$instance_alias_dir_a/routingQs_$routing_name.json" |
-                        jq -r ".RoutingProfileQueueConfigSummaryList[] | select(.QueueName == \"${q_name//\"/%22}}\") | { QueueReference: { QueueId, Channel }, Priority, Delay }" >> $TEMP1
+                        jq -r ".RoutingProfileQueueConfigSummaryList[] | select(.QueueName == \"${q_name//\"/%22}\") | { QueueReference: { QueueId, Channel }, Priority, Delay }" >> $TEMP1
                 done
-                cat $TEMP1 | sed -f "$helper_sed" | jq -s > "$helper/routingQueueConfig_$routing_name.json"
+                cat $TEMP1 | sed -f "$helper_sed" | jq -s . > "$helper/routingQueueConfig_$routing_name.json"
 
                 cat <<EOD >> "$helper_log"
 
@@ -773,10 +780,28 @@ EOD
                     # rm "$helper/routingQueueConfig_$routing_name.json"
                 else
                     cat $TEMP2
-                    aws_connect associate-routing-profile-queues \
-                        --instance-id $instance_id_b \
-                        --routing-profile-id $routing_id_b \
-                        --queue-configs "file://$helper/routingQueueConfig_$routing_name.json" || error $LINENO
+		    
+                    # batches of 10
+		    num_queues=$(jq -c ".[]" $helper/routingQueueConfig_$routing_name.json | wc -l | cut -f1 -d ' ')
+
+		    more=true
+		    batch_start=0
+		    while $more || [[ $num_queues -gt $batch_start ]]
+		    do
+		        more=false
+		        let batch_end=batch_start+10
+			echo "------------ processing batch ${batch_start}:${batch_end} ------------------"
+			cat $helper/routingQueueConfig_$routing_name.json | jq ".[${batch_start}:${batch_end}]" >$TEMP3
+			batch_start=$batch_end
+
+			cp $TEMP3 /tmp/t3.json
+
+                        aws_connect associate-routing-profile-queues \
+                            --instance-id $instance_id_b \
+                            --routing-profile-id $routing_id_b \
+			    --queue-configs "file://$TEMP3" || error $LINENO
+                            #--queue-configs "file://$helper/routingQueueConfig_$routing_name.json" || error $LINENO
+	            done
                 fi
             fi
 
@@ -1149,7 +1174,8 @@ EOD
             --instance-id $instance_id_b \
             --contact-flow-id $flow_id_b \
             --content "file://$helper/$flow_json" \
-            > "$helper/output_content_$flow_json" || error $LINENO
+            > "$helper/output_content_$flow_json" 
+            #> "$helper/output_content_$flow_json" || error $LINENO
 
         aws_connect describe-contact-flow \
             --instance-id $instance_id_b \
@@ -1182,7 +1208,8 @@ if [ -s $TEMPFILE ]; then
     aws connect list-lambda-functions \
         $profile_flag \
         --instance-id $instance_id_b \
-        > $TEMPOLD || error $LINENO
+        > $TEMPOLD
+        #> $TEMPOLD || error $LINENO
     cat $TEMPOLD |
     jq -r ".LambdaFunctions" > "$helper/lambdas.json"
 
